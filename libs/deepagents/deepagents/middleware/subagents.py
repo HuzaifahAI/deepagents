@@ -427,6 +427,36 @@ def _build_task_tool(
         subagent_state["messages"] = [HumanMessage(content=description)]
         return subagent, subagent_state
 
+    def _build_subagent_config(runtime: ToolRuntime) -> dict[str, Any]:
+        """Build a config for subagent invocation that only carries streaming keys.
+
+        Extracts only the streaming infrastructure from the parent's config:
+          - __pregel_stream (CONFIG_KEY_STREAM): the parent's StreamProtocol queue,
+            enabling subagent nodes to push custom events via StreamWriter
+          - __pregel_runtime (CONFIG_KEY_RUNTIME): the parent's Runtime object
+            (context, store, stream_writer), merged into the subagent's runtime
+
+        Everything else (callbacks, run_name, run_id, checkpoint keys, internal
+        Pregel execution state) is intentionally excluded so the subagent keeps
+        its own identity and runs independently.
+
+        When the parent is not streaming (e.g. .invoke()), neither key is present
+        and the returned config is empty — StreamWriter remains a no-op.
+        """
+        parent_configurable = runtime.config.get("configurable", {})
+        streaming_configurable: dict[str, Any] = {}
+        # These key names correspond to langgraph._internal._constants.CONFIG_KEY_STREAM
+        # and CONFIG_KEY_RUNTIME. We use string literals to avoid importing private internals.
+        # __pregel_stream: present when the parent streams with subgraphs=True
+        if "__pregel_stream" in parent_configurable:
+            streaming_configurable["__pregel_stream"] = parent_configurable["__pregel_stream"]
+        # __pregel_runtime: carries the parent's stream_writer closure
+        if "__pregel_runtime" in parent_configurable:
+            streaming_configurable["__pregel_runtime"] = parent_configurable["__pregel_runtime"]
+        if streaming_configurable:
+            return {"configurable": streaming_configurable}
+        return {}
+
     def task(
         description: Annotated[
             str,
@@ -439,7 +469,11 @@ def _build_task_tool(
             allowed_types = ", ".join([f"`{k}`" for k in subagent_graphs])
             return f"We cannot invoke subagent {subagent_type} because it does not exist, the only allowed types are {allowed_types}"
         subagent, subagent_state = _validate_and_prepare_state(subagent_type, description, runtime)
-        result = subagent.invoke(subagent_state)
+        # Propagate streaming infrastructure (CONFIG_KEY_STREAM, CONFIG_KEY_RUNTIME)
+        # from the parent to the subagent while preserving the subagent's identity.
+        # See _build_subagent_config() for full documentation of what is propagated.
+        subagent_config = _build_subagent_config(runtime)
+        result = subagent.invoke(subagent_state, subagent_config)
         if not runtime.tool_call_id:
             value_error_msg = "Tool call ID is required for subagent invocation"
             raise ValueError(value_error_msg)
@@ -457,7 +491,10 @@ def _build_task_tool(
             allowed_types = ", ".join([f"`{k}`" for k in subagent_graphs])
             return f"We cannot invoke subagent {subagent_type} because it does not exist, the only allowed types are {allowed_types}"
         subagent, subagent_state = _validate_and_prepare_state(subagent_type, description, runtime)
-        result = await subagent.ainvoke(subagent_state)
+        # Propagate streaming infrastructure to the async subagent.
+        # See _build_subagent_config() for full documentation.
+        subagent_config = _build_subagent_config(runtime)
+        result = await subagent.ainvoke(subagent_state, subagent_config)
         if not runtime.tool_call_id:
             value_error_msg = "Tool call ID is required for subagent invocation"
             raise ValueError(value_error_msg)
