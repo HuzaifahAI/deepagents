@@ -47,7 +47,7 @@ from langchain.agents.middleware.summarization import (
     TokenCounter,
 )
 from langchain.tools import ToolRuntime
-from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, get_buffer_string
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, RemoveMessage, get_buffer_string, message_to_dict
 from langchain_core.messages.utils import count_tokens_approximately
 from langgraph.config import get_config
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
@@ -62,6 +62,25 @@ if TYPE_CHECKING:
     from deepagents.backends.protocol import BACKEND_TYPES, BackendProtocol
 
 logger = logging.getLogger(__name__)
+
+
+def build_archive_namespace(thread_id: str) -> tuple[str, ...]:
+    """Build the store namespace for message archives.
+
+    Parses thread_id of the form ``{org_id}_{project_id}_{user_id}_{session_id}``.
+    Returns a 5-element namespace on success, 2-element fallback otherwise.
+
+    Args:
+        thread_id: Thread identifier string.
+
+    Returns:
+        Namespace tuple starting with ``"message_archive"``.
+    """
+    parts = thread_id.split("_", 3)
+    if len(parts) == 4:  # noqa: PLR2004
+        org_id, project_id, user_id, session_id = parts
+        return ("message_archive", org_id, project_id, user_id, session_id)
+    return ("message_archive", thread_id)
 
 
 class TruncateArgsSettings(TypedDict, total=False):
@@ -644,6 +663,105 @@ A condensed summary follows:
             logger.debug("Offloaded %d messages to %s", len(filtered_messages), path)
             return path
 
+    def _archive_to_store(
+        self,
+        messages: list[AnyMessage],
+        runtime: Runtime,
+    ) -> None:
+        """Archive evicted messages to LangGraph's BaseStore (lossless).
+
+        Serializes messages via ``msg.dict()`` (round-trippable with
+        ``messages_from_dict``) and writes them as a timestamped batch item
+        to the store. Each summarization event creates a new item so the
+        full history can be reconstructed later.
+
+        Silently skips if ``runtime.store`` is ``None``.
+
+        Args:
+            messages: Messages being evicted during summarization.
+            runtime: Runtime providing store access.
+        """
+        store = getattr(runtime, "store", None)
+        if store is None:
+            return
+
+        filtered = self._filter_summary_messages(messages)
+        if not filtered:
+            return
+
+        thread_id = self._get_thread_id()
+        namespace = build_archive_namespace(thread_id)
+        timestamp = datetime.now(UTC).isoformat()
+        key = f"archive_{timestamp}_{uuid.uuid4().hex[:8]}"
+        value = {
+            "messages": [message_to_dict(msg) for msg in filtered],
+            "archived_at": timestamp,
+            "thread_id": thread_id,
+        }
+
+        try:
+            store.put(namespace, key, value)
+            logger.debug(
+                "Archived %d messages to store namespace %s key %s",
+                len(filtered),
+                namespace,
+                key,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Failed to archive %d messages to store: %s: %s",
+                len(filtered),
+                type(e).__name__,
+                e,
+            )
+
+    async def _aarchive_to_store(
+        self,
+        messages: list[AnyMessage],
+        runtime: Runtime,
+    ) -> None:
+        """Archive evicted messages to LangGraph's BaseStore (async, lossless).
+
+        Async counterpart of :meth:`_archive_to_store`. Uses ``store.aput``.
+
+        Args:
+            messages: Messages being evicted during summarization.
+            runtime: Runtime providing store access.
+        """
+        store = getattr(runtime, "store", None)
+        if store is None:
+            return
+
+        filtered = self._filter_summary_messages(messages)
+        if not filtered:
+            return
+
+        thread_id = self._get_thread_id()
+        namespace = build_archive_namespace(thread_id)
+        timestamp = datetime.now(UTC).isoformat()
+        key = f"archive_{timestamp}_{uuid.uuid4().hex[:8]}"
+        value = {
+            "messages": [message_to_dict(msg) for msg in filtered],
+            "archived_at": timestamp,
+            "thread_id": thread_id,
+        }
+
+        try:
+            await store.aput(namespace, key, value)
+            logger.debug(
+                "Archived %d messages to store namespace %s key %s (async)",
+                len(filtered),
+                namespace,
+                key,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "Failed to archive %d messages to store (async): %s: %s",
+                len(filtered),
+                type(e).__name__,
+                e,
+            )
+
     @override
     def before_model(
         self,
@@ -705,6 +823,7 @@ A condensed summary follows:
         # Offload to backend first - abort summarization if this fails to prevent data loss
         backend = self._get_backend(state, runtime)
         file_path = self._offload_to_backend(backend, messages_to_summarize)
+        self._archive_to_store(messages_to_summarize, runtime)
         if file_path is None:
             warnings.warn(
                 "Offloading conversation history to backend failed during summarization.",
@@ -789,6 +908,7 @@ A condensed summary follows:
         # Offload to backend first - abort summarization if this fails to prevent data loss
         backend = self._get_backend(state, runtime)
         file_path = await self._aoffload_to_backend(backend, messages_to_summarize)
+        await self._aarchive_to_store(messages_to_summarize, runtime)
         if file_path is None:
             warnings.warn(
                 "Offloading conversation history to backend failed during summarization.",
