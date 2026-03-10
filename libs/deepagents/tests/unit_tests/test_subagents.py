@@ -1551,6 +1551,242 @@ class TestSubAgents:
         assert "skills_metadata" not in subagent_state, "Subagent without skills parameter should NOT have skills_metadata"
 
 
+class TestSubAgentStreaming:
+    """Tests for StreamWriter propagation from subagent nodes to the parent stream."""
+
+    def test_stream_writer_propagates_custom_events_from_subagent(self) -> None:
+        """Test that custom StreamWriter events from subagent nodes reach the parent stream.
+
+        This test verifies that passing runtime.config to subagent.invoke() enables
+        the full streaming chain:
+        1. Parent is streamed with stream_mode="custom" and subgraphs=True
+        2. Parent invokes the task tool, which calls subagent.invoke(state, runtime.config)
+        3. The subagent's node uses StreamWriter (via the `writer` kwarg) to emit custom data
+        4. That custom data appears in the parent's stream output
+        """
+        from langchain_core.messages import BaseMessage
+        from langgraph.types import StreamWriter
+
+        # Define a subagent graph with a node that emits custom stream events
+        class SubagentState(TypedDict):
+            messages: list[BaseMessage]
+
+        def streaming_node(state: SubagentState, writer: StreamWriter) -> SubagentState:
+            # Emit custom streaming events that should propagate to the parent
+            writer({"type": "progress", "data": "step-1-complete"})
+            writer({"type": "progress", "data": "step-2-complete"})
+            return {"messages": [AIMessage(content="Subagent finished with streaming.")]}
+
+        subagent_graph = StateGraph(SubagentState)
+        subagent_graph.add_node("stream_node", streaming_node)
+        subagent_graph.add_edge(START, "stream_node")
+        subagent_graph.add_edge("stream_node", END)
+        compiled_subagent = subagent_graph.compile()
+
+        # Parent agent calls the task tool to invoke the subagent
+        parent_chat_model = GenericFakeChatModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "task",
+                                "args": {
+                                    "description": "Run the streaming subagent",
+                                    "subagent_type": "streamer",
+                                },
+                                "id": "call_streamer",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="Done."),
+                ]
+            )
+        )
+
+        parent_agent = create_deep_agent(
+            model=parent_chat_model,
+            checkpointer=InMemorySaver(),
+            subagents=[
+                CompiledSubAgent(
+                    name="streamer",
+                    description="A subagent that emits custom stream events",
+                    runnable=compiled_subagent,
+                )
+            ],
+        )
+
+        # Stream with "custom" mode and subgraphs=True to receive subagent events.
+        # With subgraphs=True and a single stream_mode, each item is a 2-tuple:
+        #   (namespace_tuple, data)
+        # where namespace_tuple identifies the subgraph path (empty tuple for root).
+        custom_events: list[Any] = []
+        for namespace, data in parent_agent.stream(
+            {"messages": [HumanMessage(content="Stream test")]},
+            config={"configurable": {"thread_id": "test_stream_propagation"}},
+            stream_mode="custom",
+            subgraphs=True,
+        ):
+            custom_events.append({"namespace": namespace, "data": data})
+
+        # Verify that the custom events from the subagent node were received
+        custom_data = [e["data"] for e in custom_events]
+        assert {"type": "progress", "data": "step-1-complete"} in custom_data, (
+            f"Expected step-1-complete in custom stream events, got: {custom_data}"
+        )
+        assert {"type": "progress", "data": "step-2-complete"} in custom_data, (
+            f"Expected step-2-complete in custom stream events, got: {custom_data}"
+        )
+
+    def test_invoke_mode_stream_writer_is_noop(self) -> None:
+        """Test that using .invoke() (non-streaming) with subagents is safe and correct.
+
+        When the parent uses .invoke() instead of .stream(), CONFIG_KEY_STREAM is
+        absent from the config. The subagent's StreamWriter remains a no-op, so
+        writer() calls inside nodes silently do nothing. This test verifies:
+        1. No errors when subagent nodes call writer() in non-streaming mode
+        2. The subagent result is still correctly returned as a ToolMessage
+        """
+        from langchain_core.messages import BaseMessage
+        from langgraph.types import StreamWriter
+
+        # Same streaming subagent node — writer() calls should be harmless no-ops
+        class SubagentState(TypedDict):
+            messages: list[BaseMessage]
+
+        def streaming_node(state: SubagentState, writer: StreamWriter) -> SubagentState:
+            # These writer calls should be no-ops in invoke mode
+            writer({"type": "progress", "data": "step-1"})
+            writer({"type": "progress", "data": "step-2"})
+            return {"messages": [AIMessage(content="Result from streaming node.")]}
+
+        subagent_graph = StateGraph(SubagentState)
+        subagent_graph.add_node("stream_node", streaming_node)
+        subagent_graph.add_edge(START, "stream_node")
+        subagent_graph.add_edge("stream_node", END)
+        compiled_subagent = subagent_graph.compile()
+
+        parent_chat_model = GenericFakeChatModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "task",
+                                "args": {
+                                    "description": "Run the streaming subagent",
+                                    "subagent_type": "streamer",
+                                },
+                                "id": "call_streamer",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="Done."),
+                ]
+            )
+        )
+
+        parent_agent = create_deep_agent(
+            model=parent_chat_model,
+            checkpointer=InMemorySaver(),
+            subagents=[
+                CompiledSubAgent(
+                    name="streamer",
+                    description="A subagent that emits custom stream events",
+                    runnable=compiled_subagent,
+                )
+            ],
+        )
+
+        # Use .invoke() — no streaming, writer should be a no-op
+        result = parent_agent.invoke(
+            {"messages": [HumanMessage(content="Non-streaming test")]},
+            config={"configurable": {"thread_id": "test_invoke_noop"}},
+        )
+
+        # Verify the subagent result was correctly returned
+        assert "messages" in result
+        tool_messages = [msg for msg in result["messages"] if msg.type == "tool"]
+        assert len(tool_messages) > 0, "Should have at least one ToolMessage from subagent"
+        assert "Result from streaming node." in tool_messages[0].content
+
+    @pytest.mark.asyncio
+    async def test_async_stream_writer_propagates_custom_events(self) -> None:
+        """Test that custom StreamWriter events from async subagent nodes reach the parent.
+
+        Same as test_stream_writer_propagates_custom_events_from_subagent but uses
+        the async path (ainvoke/astream) to verify the async atask() closure also
+        passes runtime.config correctly.
+        """
+        from langchain_core.messages import BaseMessage
+        from langgraph.types import StreamWriter
+
+        class SubagentState(TypedDict):
+            messages: list[BaseMessage]
+
+        def streaming_node(state: SubagentState, writer: StreamWriter) -> SubagentState:
+            writer({"type": "async_progress", "data": "async-step-1"})
+            return {"messages": [AIMessage(content="Async subagent done.")]}
+
+        subagent_graph = StateGraph(SubagentState)
+        subagent_graph.add_node("stream_node", streaming_node)
+        subagent_graph.add_edge(START, "stream_node")
+        subagent_graph.add_edge("stream_node", END)
+        compiled_subagent = subagent_graph.compile()
+
+        parent_chat_model = GenericFakeChatModel(
+            messages=iter(
+                [
+                    AIMessage(
+                        content="",
+                        tool_calls=[
+                            {
+                                "name": "task",
+                                "args": {
+                                    "description": "Run async streaming subagent",
+                                    "subagent_type": "async-streamer",
+                                },
+                                "id": "call_async_streamer",
+                                "type": "tool_call",
+                            }
+                        ],
+                    ),
+                    AIMessage(content="Async done."),
+                ]
+            )
+        )
+
+        parent_agent = create_deep_agent(
+            model=parent_chat_model,
+            checkpointer=InMemorySaver(),
+            subagents=[
+                CompiledSubAgent(
+                    name="async-streamer",
+                    description="An async subagent that emits custom stream events",
+                    runnable=compiled_subagent,
+                )
+            ],
+        )
+
+        custom_events: list[Any] = []
+        async for namespace, data in parent_agent.astream(
+            {"messages": [HumanMessage(content="Async stream test")]},
+            config={"configurable": {"thread_id": "test_async_stream"}},
+            stream_mode="custom",
+            subgraphs=True,
+        ):
+            custom_events.append({"namespace": namespace, "data": data})
+
+        custom_data = [e["data"] for e in custom_events]
+        assert {"type": "async_progress", "data": "async-step-1"} in custom_data, (
+            f"Expected async-step-1 in custom stream events, got: {custom_data}"
+        )
+
+
 class TestSubAgentMiddlewareValidation:
     """Tests for SubAgentMiddleware initialization validation."""
 
